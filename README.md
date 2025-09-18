@@ -20,7 +20,7 @@ Solidly is a 3D computational geometry library designed in the spirit of Shapely
 - Robust for convex shapes and simple edge cases
 ## Boolean Operations
 - Points, lines, polygons: union, intersection, difference
-- Convex polyhedra: union (via convex hull), with intersection/difference planned
+- Convex polyhedra: union (via convex hull), difference, intersection partially implemented (fails on vertex-only intersection)
 - Coplanar convex polygons: intersection/difference via Sutherland–Hodgman
 ## Robustness & Validation
 - is_simple, is_convex, is_closed, almost_equals

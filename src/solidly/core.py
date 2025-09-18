@@ -723,16 +723,201 @@ class Polyhedron:
             raise NotImplementedError("This is a stub. Install 'scipy.spatial.convexhull' for full functionality.")
 
 
-    def intersection(self, other):
+    def intersection(self, other, debug: bool = False):
         """
-        Intersection of two convex polyhedra (MVP):
-        Returns a new Polyhedron if both are convex and intersect, else None.
-        Uses intersection of all half-spaces (faces) from both polyhedra.
+        Robust intersection for convex polyhedra.
+
+        Tries, in order:
+        1. Use scipy.spatial.HalfspaceIntersection (preferred).
+        2. If needed, find a feasible interior point via linprog.
+        3. Fallback: enumerate triple-plane intersections & keep points that satisfy all half-spaces.
+
+        Returns a Polyhedron or None.
         """
         if not isinstance(other, Polyhedron):
             raise NotImplementedError("Intersection only supported for Polyhedron.")
-        # For MVP, not implemented (would require half-space intersection)
-        return None
+        if not (self.is_convex() and other.is_convex()):
+            raise NotImplementedError("Intersection only implemented for convex polyhedra.")
+        if not self.intersects(other):
+            return None  # quick AABB reject
+
+        from itertools import combinations
+
+        # --- Build planes (n, d) where inside is n·x <= d ---
+        planes = []
+        for poly in (self, other):
+            verts_arr = np.array([v.to_array() for f in poly.faces for v in f.vertices])
+            if verts_arr.size == 0:
+                continue
+            centroid_poly = verts_arr.mean(axis=0)
+            for face in poly.faces:
+                verts = [v.to_array() for v in face.vertices]
+                if len(verts) < 3:
+                    continue
+                n = np.cross(verts[1] - verts[0], verts[2] - verts[0])
+                n_norm = np.linalg.norm(n)
+                if n_norm < 1e-12:
+                    continue
+                n = n / n_norm
+                v0 = verts[0]
+                d = float(np.dot(n, v0))
+                # orient so that interior satisfies n·x <= d
+                if np.dot(centroid_poly, n) > d:
+                    n = -n
+                    d = -d
+                planes.append((n, d))
+
+        if len(planes) < 4:
+            return None
+
+        # Prepare arrays for convenience
+        A = np.vstack([n for n, d in planes])
+        d_arr = np.array([d for n, d in planes])
+
+        # SciPy HalfspaceIntersection expects halfspaces stacked as [A, b]
+        # with inequalities A x + b <= 0. For n·x <= d, row = [n, -d].
+        halfspaces = np.hstack([A, (-d_arr)[:, None]])
+
+        # Try to find a feasible interior point
+        def is_feasible(pt, tol=1e-9):
+            return np.all(np.dot(A, pt) <= d_arr + tol)
+
+        # try simple interior point heuristics first
+        try:
+            centroid_self = np.array([v.to_array() for f in self.faces for v in f.vertices]).mean(axis=0)
+            centroid_other = np.array([v.to_array() for f in other.faces for v in f.vertices]).mean(axis=0)
+        except Exception:
+            centroid_self = None
+            centroid_other = None
+
+        interior = None
+        if centroid_self is not None and centroid_other is not None:
+            cand = 0.5 * (centroid_self + centroid_other)
+            if is_feasible(cand):
+                interior = cand
+            elif is_feasible(centroid_self):
+                interior = centroid_self
+            elif is_feasible(centroid_other):
+                interior = centroid_other
+
+        # If heuristics failed, try linear programming to get a feasible interior point
+        if interior is None:
+            try:
+                from scipy.optimize import linprog
+                m = A.shape[0]
+                # Maximize slack t subject to A x + t <= d  ->  A x + 1*t <= d
+                A_ub = np.hstack([A, np.ones((m, 1))])
+                b_ub = d_arr
+                c = np.array([0.0, 0.0, 0.0, -1.0])  # minimize -t == maximize t
+                bounds = [(None, None), (None, None), (None, None), (None, None)]
+                res = linprog(c, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
+                if res.success:
+                    t = res.x[-1]
+                    x = res.x[:3]
+                    if t >= -1e-9 and is_feasible(x, tol=1e-8):
+                        interior = x
+                if debug:
+                    print("linprog success:", getattr(res, "success", False), "t:", getattr(res, "x", None) and res.x[-1])
+            except Exception as e:
+                if debug:
+                    print("linprog unavailable/failed:", e)
+                interior = None
+
+        # Primary path: use SciPy HalfspaceIntersection if interior point found and SciPy present
+        if interior is not None:
+            try:
+                from scipy.spatial import HalfspaceIntersection, ConvexHull
+                hs = HalfspaceIntersection(halfspaces=halfspaces, interior_point=np.asarray(interior))
+                pts = np.asarray(hs.intersections)  # shape (n_vertices, 3)
+                if debug:
+                    print("HalfspaceIntersection produced vertices:", pts.shape[0])
+                if pts.shape[0] == 0:
+                    # fallback to triple-plane enumeration
+                    interior = None
+                else:
+                    # Deduplicate
+                    rounded = np.round(pts, 10)  # nicer dedupe precision
+                    _, idx = np.unique(rounded, axis=0, return_index=True)
+                    unique_pts = pts[np.sort(idx)]
+                    if unique_pts.shape[0] < 4:
+                        return None
+                    hull = ConvexHull(unique_pts)
+                    faces = []
+                    for simplex in hull.simplices:
+                        faces.append(Polygon3D(tuple(Point3D(*unique_pts[i]) for i in simplex)))
+                    result = Polyhedron(tuple(faces))
+                    if result.volume() <= 1e-10:
+                        return None
+                    return result
+            except Exception as e:
+                if debug:
+                    print("HalfspaceIntersection path failed:", e)
+                # fallthrough to triple-plane fallback
+
+        # --- Fallback: enumerate all triplets of planes and keep points inside all half-spaces ---
+        candidate_points = []
+        tol_det = 1e-12
+        tol_halfspace = 1e-8
+        nplanes = len(planes)
+        if debug:
+            print("fallback triple-plane enumeration over", nplanes, "planes")
+        for (i, j, k) in combinations(range(nplanes), 3):
+            n1, d1 = planes[i]
+            n2, d2 = planes[j]
+            n3, d3 = planes[k]
+            M = np.vstack((n1, n2, n3))
+            detM = np.linalg.det(M)
+            if abs(detM) < tol_det:
+                continue
+            try:
+                p = np.linalg.solve(M, np.array([d1, d2, d3]))
+            except np.linalg.LinAlgError:
+                continue
+            # keep p only if satisfies all half-spaces
+            ok = True
+            for (n, d) in planes:
+                if np.dot(n, p) > d + tol_halfspace:
+                    ok = False
+                    break
+            if ok:
+                candidate_points.append(Point3D(*p))
+
+        # include existing vertices that lie inside both for robustness
+        for v in (v for f in self.faces for v in f.vertices):
+            if other.contains(v):
+                candidate_points.append(v)
+        for v in (v for f in other.faces for v in f.vertices):
+            if self.contains(v):
+                candidate_points.append(v)
+
+        if debug:
+            print("raw candidate points:", len(candidate_points))
+        if not candidate_points:
+            return None
+
+        arrs = np.array([p.to_array() for p in candidate_points])
+        rounded = np.round(arrs, 8)
+        _, idx = np.unique(rounded, axis=0, return_index=True)
+        unique_pts = arrs[np.sort(idx)]
+
+        if unique_pts.shape[0] < 4:
+            return None
+
+        try:
+            from scipy.spatial import ConvexHull
+            hull = ConvexHull(unique_pts)
+            faces = []
+            for simplex in hull.simplices:
+                faces.append(Polygon3D(tuple(Point3D(*unique_pts[i]) for i in simplex)))
+            result = Polyhedron(tuple(faces))
+            if result.volume() <= 1e-10:
+                return None
+            return result
+        except Exception as e:
+            if debug:
+                print("ConvexHull failed on fallback points:", e)
+            return None
+
 
 
     def difference(self, other):
