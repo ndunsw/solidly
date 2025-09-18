@@ -404,6 +404,7 @@ class Polygon3D:
             hull_pts = [verts[i] for i in hull.vertices]
             return Polygon3D(tuple(hull_pts))
         raise NotImplementedError("Union only defined for Polygon3D.")
+    
     def intersection(self, other):
         """
         Intersect this polygon with another convex, coplanar polygon using Sutherland-Hodgman.
@@ -733,16 +734,32 @@ class Polyhedron:
         # For MVP, not implemented (would require half-space intersection)
         return None
 
+
     def difference(self, other):
         """
         Difference of two convex polyhedra (MVP):
         Returns a new Polyhedron if both are convex, else None.
-        Not implemented for MVP.
+        MVP: Clips each face of self by all faces of other using polygon difference.
         """
         if not isinstance(other, Polyhedron):
             raise NotImplementedError("Difference only supported for Polyhedron.")
-        # For MVP, not implemented
+        # For MVP: clip each face of self by all faces of other
+        new_faces = []
+        for face in self.faces:
+            diff_face = face
+            for other_face in other.faces:
+                diff = diff_face.difference(other_face)
+                if diff is not None and hasattr(diff, 'vertices') and len(diff.vertices) >= 3:
+                    diff_face = diff
+                else:
+                    diff_face = None
+                    break
+            if diff_face is not None and hasattr(diff_face, 'vertices') and len(diff_face.vertices) >= 3:
+                new_faces.append(diff_face)
+        if new_faces:
+            return Polyhedron(tuple(new_faces))
         return None
+    
     def contains(self, other):
         """True if other (Point3D) is inside the convex polyhedron (MVP: convex only, robust normal orientation)."""
         if isinstance(other, Point3D):
